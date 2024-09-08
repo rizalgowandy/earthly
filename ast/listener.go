@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
+	"unicode"
 
+	"github.com/antlr/antlr4/runtime/Go/antlr/v4"
 	"github.com/earthly/earthly/ast/parser"
 	"github.com/earthly/earthly/ast/spec"
 	"github.com/pkg/errors"
@@ -19,6 +22,7 @@ type block struct {
 	withStatement *spec.WithStatement
 	ifStatement   *spec.IfStatement
 	elseIf        *spec.ElseIf
+	tryStatement  *spec.TryStatement
 	forStatement  *spec.ForStatement
 	waitStatement *spec.WaitStatement
 }
@@ -26,11 +30,12 @@ type block struct {
 type listener struct {
 	*parser.BaseEarthParserListener
 
-	ef          *spec.Earthfile
-	target      *spec.Target
-	userCommand *spec.UserCommand
-	blocks      []*block
-	command     *spec.Command
+	tokStream *antlr.CommonTokenStream
+	ef        *spec.Earthfile
+	target    *spec.Target
+	function  *spec.Function
+	blocks    []*block
+	command   *spec.Command
 
 	stmtWords []string
 	execMode  bool
@@ -42,7 +47,7 @@ type listener struct {
 	err error
 }
 
-func newListener(ctx context.Context, filePath string, enableSourceMap bool) *listener {
+func newListener(ctx context.Context, stream *antlr.CommonTokenStream, filePath string, enableSourceMap bool) *listener {
 	ef := &spec.Earthfile{}
 	if enableSourceMap {
 		ef.SourceLocation = &spec.SourceLocation{
@@ -50,6 +55,7 @@ func newListener(ctx context.Context, filePath string, enableSourceMap bool) *li
 		}
 	}
 	return &listener{
+		tokStream:       stream,
 		ctx:             ctx,
 		filePath:        filePath,
 		enableSourceMap: enableSourceMap,
@@ -82,6 +88,32 @@ func (l *listener) popBlock() spec.Block {
 	return ret
 }
 
+func (l *listener) docs(c antlr.ParserRuleContext) string {
+	comments := l.tokStream.GetHiddenTokensToLeft(c.GetStart().GetTokenIndex(), parser.EarthLexerCOMMENTS_CHANNEL)
+	var docs string
+	var leadingTrim string
+	var once sync.Once
+	for _, c := range comments {
+		line := strings.TrimSpace(c.GetText())
+		line = strings.TrimPrefix(line, "#")
+		once.Do(func() {
+			runes := []rune(line)
+			var trimRunes []rune
+			for _, r := range runes {
+				if unicode.IsSpace(r) {
+					trimRunes = append(trimRunes, r)
+					continue
+				}
+				break
+			}
+			leadingTrim = string(trimRunes)
+		})
+		line = strings.TrimPrefix(line, leadingTrim)
+		docs += line + "\n"
+	}
+	return docs
+}
+
 // Base -----------------------------------------------------------------------
 
 func (l *listener) EnterEarthFile(c *parser.EarthFileContext) {
@@ -109,7 +141,8 @@ func (l *listener) EnterTarget(c *parser.TargetContext) {
 }
 
 func (l *listener) EnterTargetHeader(c *parser.TargetHeaderContext) {
-	l.target.Name = strings.TrimSuffix(c.GetText(), ":")
+	l.target.Name = strings.TrimSuffix(c.Target().GetText(), ":")
+	l.target.Docs = l.docs(c)
 }
 
 func (l *listener) ExitTarget(c *parser.TargetContext) {
@@ -121,9 +154,9 @@ func (l *listener) ExitTarget(c *parser.TargetContext) {
 // User command ---------------------------------------------------------------
 
 func (l *listener) EnterUserCommand(c *parser.UserCommandContext) {
-	l.userCommand = new(spec.UserCommand)
+	l.function = new(spec.Function)
 	if l.enableSourceMap {
-		l.userCommand.SourceLocation = &spec.SourceLocation{
+		l.function.SourceLocation = &spec.SourceLocation{
 			File:        l.filePath,
 			StartLine:   c.GetStart().GetLine(),
 			StartColumn: c.GetStart().GetColumn(),
@@ -135,13 +168,39 @@ func (l *listener) EnterUserCommand(c *parser.UserCommandContext) {
 }
 
 func (l *listener) EnterUserCommandHeader(c *parser.UserCommandHeaderContext) {
-	l.userCommand.Name = strings.TrimSuffix(c.GetText(), ":")
+	l.function.Name = strings.TrimSuffix(c.GetText(), ":")
 }
 
 func (l *listener) ExitUserCommand(c *parser.UserCommandContext) {
-	l.userCommand.Recipe = l.popBlock()
-	l.ef.UserCommands = append(l.ef.UserCommands, *l.userCommand)
-	l.userCommand = nil
+	l.function.Recipe = l.popBlock()
+	l.ef.Functions = append(l.ef.Functions, *l.function)
+	l.function = nil
+}
+
+// Function ---------------------------------------------------------------
+
+func (l *listener) EnterFunction(c *parser.FunctionContext) {
+	l.function = new(spec.Function)
+	if l.enableSourceMap {
+		l.function.SourceLocation = &spec.SourceLocation{
+			File:        l.filePath,
+			StartLine:   c.GetStart().GetLine(),
+			StartColumn: c.GetStart().GetColumn(),
+			EndLine:     c.GetStop().GetLine(),
+			EndColumn:   c.GetStop().GetColumn(),
+		}
+	}
+	l.pushNewBlock()
+}
+
+func (l *listener) EnterFunctionHeader(c *parser.FunctionHeaderContext) {
+	l.function.Name = strings.TrimSuffix(c.GetText(), ":")
+}
+
+func (l *listener) ExitFunction(c *parser.FunctionContext) {
+	l.function.Recipe = l.popBlock()
+	l.ef.Functions = append(l.ef.Functions, *l.function)
+	l.function = nil
 }
 
 // Statement ------------------------------------------------------------------
@@ -167,7 +226,9 @@ func (l *listener) ExitStmt(c *parser.StmtContext) {
 // Command --------------------------------------------------------------------
 
 func (l *listener) EnterCommandStmt(c *parser.CommandStmtContext) {
-	l.command = new(spec.Command)
+	l.command = &spec.Command{
+		Docs: l.docs(c),
+	}
 	if l.enableSourceMap {
 		l.command.SourceLocation = &spec.SourceLocation{
 			File:        l.filePath,
@@ -254,6 +315,14 @@ func (l *listener) EnterArgStmt(c *parser.ArgStmtContext) {
 	l.command.Name = "ARG"
 }
 
+func (l *listener) EnterSetStmt(c *parser.SetStmtContext) {
+	l.command.Name = "SET"
+}
+
+func (l *listener) EnterLetStmt(c *parser.LetStmtContext) {
+	l.command.Name = "LET"
+}
+
 func (l *listener) EnterLabelStmt(c *parser.LabelStmtContext) {
 	l.command.Name = "LABEL"
 }
@@ -284,6 +353,10 @@ func (l *listener) EnterShellStmt(c *parser.ShellStmtContext) {
 
 func (l *listener) EnterUserCommandStmt(c *parser.UserCommandStmtContext) {
 	l.command.Name = "COMMAND"
+}
+
+func (l *listener) EnterFunctionStmt(c *parser.FunctionStmtContext) {
+	l.command.Name = "FUNCTION"
 }
 
 func (l *listener) EnterDoStmt(c *parser.DoStmtContext) {
@@ -453,6 +526,53 @@ func (l *listener) ExitElseBlock(c *parser.ElseBlockContext) {
 	l.block().ifStatement.ElseBody = &elseBlock
 }
 
+// Try -------------------------------------------------------------------------
+
+func (l *listener) EnterTryStmt(c *parser.TryStmtContext) {
+	l.block().tryStatement = new(spec.TryStatement)
+	if l.enableSourceMap {
+		l.block().tryStatement.SourceLocation = &spec.SourceLocation{
+			File:        l.filePath,
+			StartLine:   c.GetStart().GetLine(),
+			StartColumn: c.GetStart().GetColumn(),
+			EndLine:     c.GetStop().GetLine(),
+			EndColumn:   c.GetStop().GetColumn(),
+		}
+	}
+}
+
+func (l *listener) ExitTryStmt(c *parser.TryStmtContext) {
+	l.block().statement.Try = l.block().tryStatement
+	l.block().tryStatement = nil
+}
+
+func (l *listener) EnterTryBlock(c *parser.TryBlockContext) {
+	l.pushNewBlock()
+}
+
+func (l *listener) ExitTryBlock(c *parser.TryBlockContext) {
+	tryBlock := l.popBlock()
+	l.block().tryStatement.TryBody = tryBlock
+}
+
+func (l *listener) EnterCatchBlock(c *parser.CatchBlockContext) {
+	l.pushNewBlock()
+}
+
+func (l *listener) ExitCatchBlock(c *parser.CatchBlockContext) {
+	catchBlock := l.popBlock()
+	l.block().tryStatement.CatchBody = &catchBlock
+}
+
+func (l *listener) EnterFinallyBlock(c *parser.FinallyBlockContext) {
+	l.pushNewBlock()
+}
+
+func (l *listener) ExitFinallyBlock(c *parser.FinallyBlockContext) {
+	finallyBlock := l.popBlock()
+	l.block().tryStatement.FinallyBody = &finallyBlock
+}
+
 // For ------------------------------------------------------------------------
 
 func (l *listener) EnterForStmt(c *parser.ForStmtContext) {
@@ -569,11 +689,8 @@ func (l *listener) EnterStmtWord(c *parser.StmtWordContext) {
 
 // ----------------------------------------------------------------------------
 
-var envVarNameRegexp = regexp.MustCompile(`^[a-zA-Z_]+[a-zA-Z0-9_]*$`)
-
 func checkEnvVarName(str string) error {
-	itMatch := envVarNameRegexp.MatchString(str)
-	if !itMatch {
+	if !IsValidEnvVarName(str) {
 		return errors.Errorf("invalid env key definition %s", str)
 	}
 	return nil

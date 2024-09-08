@@ -5,19 +5,20 @@ type Earthfile struct {
 	Version        *Version        `json:"version,omitempty"`
 	BaseRecipe     Block           `json:"baseRecipe"`
 	Targets        []Target        `json:"targets,omitempty"`
-	UserCommands   []UserCommand   `json:"userCommands,omitempty"`
+	Functions      []Function      `json:"functions,omitempty"`
 	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
 }
 
 // Target is the AST representation of an Earthfile target.
 type Target struct {
 	Name           string          `json:"name"`
+	Docs           string          `json:"docs,omitempty"`
 	Recipe         Block           `json:"recipe"`
 	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
 }
 
-// UserCommand is the AST representation of an Earthfile user command definition.
-type UserCommand struct {
+// Function is the AST representation of an Earthfile function definition.
+type Function struct {
 	Name           string          `json:"name"`
 	Recipe         Block           `json:"recipe"`
 	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
@@ -38,6 +39,7 @@ type Statement struct {
 	Command        *Command        `json:"command,omitempty"`
 	With           *WithStatement  `json:"with,omitempty"`
 	If             *IfStatement    `json:"if,omitempty"`
+	Try            *TryStatement   `json:"try,omitempty"`
 	For            *ForStatement   `json:"for,omitempty"`
 	Wait           *WaitStatement  `json:"wait,omitempty"`
 	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
@@ -46,9 +48,20 @@ type Statement struct {
 // Command is the AST representation of an Earthfile command.
 type Command struct {
 	Name           string          `json:"name"`
+	Docs           string          `json:"docs,omitempty"`
 	Args           []string        `json:"args"`
 	ExecMode       bool            `json:"execMode,omitempty"`
 	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
+}
+
+func (c Command) Clone() Command {
+	newCmd := c
+	args := make([]string, len(c.Args))
+	copy(args, c.Args)
+	newCmd.Args = args
+	srcLoc := *c.SourceLocation
+	newCmd.SourceLocation = &srcLoc
+	return newCmd
 }
 
 // WithStatement is the AST representation of a with statement.
@@ -65,6 +78,14 @@ type IfStatement struct {
 	IfBody         Block           `json:"ifBody"`
 	ElseIf         []ElseIf        `json:"elseIf,omitempty"`
 	ElseBody       *Block          `json:"elseBody,omitempty"`
+	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
+}
+
+// TryStatement is the AST representation of a try statement.
+type TryStatement struct {
+	TryBody        Block           `json:"tryBody"`
+	CatchBody      *Block          `json:"catchBody,omitempty"`
+	FinallyBody    *Block          `json:"finallyBody,omitempty"`
 	SourceLocation *SourceLocation `json:"sourceLocation,omitempty"`
 }
 

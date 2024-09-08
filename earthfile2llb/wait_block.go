@@ -4,102 +4,101 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/earthly/earthly/conslogging"
 	"github.com/earthly/earthly/domain"
-	"github.com/earthly/earthly/states"
+	"github.com/earthly/earthly/util/dockerutil"
 	"github.com/earthly/earthly/util/gatewaycrafter"
 	"github.com/earthly/earthly/util/llbutil"
-	"github.com/earthly/earthly/util/llbutil/pllb"
 	"github.com/earthly/earthly/util/saveartifactlocally"
 	"github.com/earthly/earthly/util/syncutil/semutil"
 	"github.com/earthly/earthly/util/syncutil/serrgroup"
+	"github.com/earthly/earthly/util/waitutil"
 
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/pkg/errors"
 )
 
-type saveImageWaitItem struct {
-	c           *Converter
-	si          states.SaveImage
-	push        bool
-	localExport bool
-}
-
-type stateWaitItem struct {
-	c     *Converter
-	state *pllb.State
-}
-
-type saveArtifactLocalWaitItem struct {
-	c         *Converter
-	saveLocal states.SaveLocal
-}
-
-// waitItem should be either saveImageWaitItem or stateWaitItem
-type waitItem interface {
-}
-
 type waitBlock struct {
-	items []waitItem
-	mu    sync.Mutex
+	items     []waitutil.WaitItem
+	seenItems map[waitutil.WaitItem]struct{}
+	mu        sync.Mutex
+
+	// used for short-circuiting
+	called            bool
+	pushCalled        bool
+	localExportCalled bool
 }
 
 func newWaitBlock() *waitBlock {
-	return &waitBlock{}
-}
-
-func (wb *waitBlock) addSaveImage(si states.SaveImage, c *Converter, push, localExport bool) {
-	wb.mu.Lock()
-	defer wb.mu.Unlock()
-	item := saveImageWaitItem{
-		c:           c,
-		si:          si,
-		push:        push,
-		localExport: localExport,
+	return &waitBlock{
+		seenItems: map[waitutil.WaitItem]struct{}{},
 	}
-	wb.items = append(wb.items, &item)
 }
 
-func (wb *waitBlock) addState(state *pllb.State, c *Converter) {
+func (wb *waitBlock) SetDoSaves() {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
-	item := stateWaitItem{
-		c:     c,
-		state: state,
+	for _, wi := range wb.items {
+		wi.SetDoSave()
 	}
-	wb.items = append(wb.items, &item)
 }
 
-func (wb *waitBlock) addSaveArtifactLocal(state states.SaveLocal, c *Converter) {
+func (wb *waitBlock) SetDoPushes() {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
-	item := saveArtifactLocalWaitItem{
-		c:         c,
-		saveLocal: state,
+	for _, wi := range wb.items {
+		wi.SetDoPush()
 	}
-	wb.items = append(wb.items, &item)
 }
 
-func (wb *waitBlock) wait(ctx context.Context) error {
+func (wb *waitBlock) AddItem(item waitutil.WaitItem) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
+	_, exists := wb.seenItems[item]
+	if exists {
+		return
+	}
+	wb.seenItems[item] = struct{}{}
+	wb.items = append(wb.items, item)
+}
+
+func (wb *waitBlock) Wait(ctx context.Context, push, localExport bool) error {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+
+	shortCircuit := wb.called
+	wb.called = true
+	if push && !wb.pushCalled {
+		shortCircuit = false
+		wb.pushCalled = true
+	}
+	if localExport && !wb.localExportCalled {
+		shortCircuit = false
+		wb.localExportCalled = true
+	}
+	if shortCircuit {
+		return nil
+	}
 
 	errGroup, ctx := serrgroup.WithContext(ctx)
 	errGroup.Go(func() error {
-		return wb.saveImages(ctx)
+		return wb.saveImages(ctx, push, localExport)
 	})
-	errGroup.Go(func() error {
-		return wb.saveArtifactLocal(ctx)
-	})
+	if localExport {
+		errGroup.Go(func() error {
+			return wb.saveArtifactLocal(ctx)
+		})
+	}
 	errGroup.Go(func() error {
 		return wb.waitStates(ctx)
 	})
 	return errGroup.Wait()
 }
 
-func (wb *waitBlock) saveImages(ctx context.Context) error {
+func (wb *waitBlock) saveImages(ctx context.Context, pushesAllowed, localExportsAllowed bool) error {
 	isMultiPlatform := make(map[string]bool)        // DockerTag -> bool
 	noManifestListImgs := make(map[string]struct{}) // set based on DockerTag
 	platformImgNames := make(map[string]bool)
@@ -109,6 +108,10 @@ func (wb *waitBlock) saveImages(ctx context.Context) error {
 	for _, item := range wb.items {
 		saveImage, ok := item.(*saveImageWaitItem)
 		if !ok {
+			continue
+		}
+
+		if !saveImage.doPush && !saveImage.localExport {
 			continue
 		}
 
@@ -130,7 +133,7 @@ func (wb *waitBlock) saveImages(ctx context.Context) error {
 				noManifestListImgs[saveImage.si.DockerTag] = struct{}{}
 				isMultiPlatform[saveImage.si.DockerTag] = false
 			} else {
-				isMultiPlatform[saveImage.si.DockerTag] = true // do I need to count for previsouly seen?
+				isMultiPlatform[saveImage.si.DockerTag] = true // do I need to count for previously seen?
 			}
 		} else {
 			isMultiPlatform[saveImage.si.DockerTag] = false
@@ -143,10 +146,14 @@ func (wb *waitBlock) saveImages(ctx context.Context) error {
 
 	gwCrafter := gatewaycrafter.NewGatewayCrafter()
 
+	// these are used to pass manifest data to the onImage function in builder.go; this only applies to non-local-registry exports (e.g. satellites)
+	var tarImagesInWaitBlockRefPrefixes []string
+	var tarImagesInWaitBlock []string
+
 	refID := 0
 	for _, item := range imageWaitItems {
 		sessionID := item.c.opt.GwClient.BuildOpts().SessionID
-		pullPingMap := item.c.opt.PullPingMap
+		exportCoordinator := item.c.opt.ExportCoordinator
 		ref, err := llbutil.StateToRef(
 			ctx, item.c.opt.GwClient, item.si.State, item.c.opt.NoCache,
 			item.c.platr, item.c.opt.CacheImports.AsSlice())
@@ -167,7 +174,7 @@ func (wb *waitBlock) saveImages(ctx context.Context) error {
 				if _, found := platformImgNames[platformImgName]; found {
 					return errors.Errorf(
 						"image %s is defined multiple times for the same platform (%s)",
-						item.si.DockerTag, platformImgName)
+						item.si.DockerTag, item.si.Platform.String())
 				}
 				platformImgNames[platformImgName] = true
 			}
@@ -182,7 +189,7 @@ func (wb *waitBlock) saveImages(ctx context.Context) error {
 			}
 		}
 
-		refPrefix, err := gwCrafter.AddPushImageEntry(ref, refID, item.si.DockerTag, item.push, item.si.InsecurePush, item.si.Image, platformBytes)
+		refPrefix, err := gwCrafter.AddPushImageEntry(ref, refID, item.si.DockerTag, item.doPush, item.si.InsecurePush, item.si.Image, platformBytes)
 		if err != nil {
 			return err
 		}
@@ -195,22 +202,37 @@ func (wb *waitBlock) saveImages(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
+
+				exportCoordinatorImageID := exportCoordinator.AddImage(sessionID, item.si.DockerTag, &dockerutil.Manifest{
+					ImageName: platformImgName,
+					Platform:  item.si.Platform,
+				})
+
 				if item.c.opt.UseLocalRegistry {
-					localRegPullID := pullPingMap.Insert(sessionID, platformImgName)
-					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image-local-registry", refPrefix), []byte(localRegPullID))
+					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image-local-registry", refPrefix), []byte(exportCoordinatorImageID))
 				} else {
 					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image", refPrefix), []byte("true"))
+					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image-manifest-key", refPrefix), []byte(exportCoordinatorImageID))
+					tarImagesInWaitBlockRefPrefixes = append(tarImagesInWaitBlockRefPrefixes, refPrefix)
+					tarImagesInWaitBlock = append(tarImagesInWaitBlock, exportCoordinatorImageID)
 				}
 				refID++
 			} else {
 				if item.c.opt.UseLocalRegistry {
-					localRegPullID := pullPingMap.Insert(sessionID, item.si.DockerTag)
-					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image-local-registry", refPrefix), []byte(localRegPullID))
+					exportCoordinatorImageID := exportCoordinator.AddImage(sessionID, item.si.DockerTag, nil)
+					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image-local-registry", refPrefix), []byte(exportCoordinatorImageID))
 				} else {
 					gwCrafter.AddMeta(fmt.Sprintf("%s/export-image", refPrefix), []byte("true"))
 				}
 			}
-
+			exportCoordinator.AddLocalOutputSummary(item.c.target.String(), item.si.DockerTag, item.c.mts.Final.ID)
+		}
+	}
+	if len(tarImagesInWaitBlockRefPrefixes) != 0 {
+		waitFor := strings.Join(tarImagesInWaitBlock, " ")
+		// the wait-for entry is used to know when all multiplatform images have been exported, thus making it safe to load manifests
+		for _, refPrefix := range tarImagesInWaitBlockRefPrefixes {
+			gwCrafter.AddMeta(fmt.Sprintf("%s/export-image-wait-for", refPrefix), []byte(waitFor))
 		}
 	}
 
@@ -281,6 +303,7 @@ func (wb *waitBlock) saveArtifactLocal(ctx context.Context) error {
 
 	var gatewayClient gwclient.Client
 	var console conslogging.ConsoleLogger
+	var exportCoordinator *gatewaycrafter.ExportCoordinator
 	artifacts := []saveArtifactLocalEntry{}
 
 	for refID, item := range wb.items {
@@ -293,6 +316,7 @@ func (wb *waitBlock) saveArtifactLocal(ctx context.Context) error {
 		i := saveLocalItem.saveLocal.Index
 		gatewayClient = c.opt.GwClient
 		console = c.opt.Console
+		exportCoordinator = c.opt.ExportCoordinator
 
 		state := c.mts.Final.SeparateArtifactsState[i]
 
@@ -342,13 +366,9 @@ func (wb *waitBlock) saveArtifactLocal(ctx context.Context) error {
 		return err
 	}
 
-	outputConsole := conslogging.NewBufferedLogger(&console)
-	defer outputConsole.Flush()
-
 	for _, entry := range artifacts {
 		err = saveartifactlocally.SaveArtifactLocally(
-			ctx, console, outputConsole, entry.artifact, entry.artifactDir, entry.destPath,
-			entry.salt, true, entry.ifExists)
+			ctx, exportCoordinator, console, entry.artifact, entry.artifactDir, entry.destPath, entry.salt, entry.ifExists)
 		if err != nil {
 			return err
 		}

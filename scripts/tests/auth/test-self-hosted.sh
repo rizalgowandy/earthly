@@ -24,6 +24,10 @@ earthly=${earthly:=earthly}
 earthly=$(realpath "$earthly")
 echo "running tests with $earthly"
 
+frontend="${frontend:-$(which docker || which podman)}"
+test -n "$frontend" || (>&2 echo "Error: frontend is empty" && exit 1)
+echo "using frontend $frontend"
+
 # use host IP, otherwise earthly-buildkit won't be able to connect to it
 ip=$(ifconfig eth0 | grep -w 'inet' | awk '{print $2}')
 test -n "$ip"
@@ -62,11 +66,12 @@ git config --global user.email "inigo@montoya.com"
 git config --global user.name "my name is Inigo Montoya"
 
 # create an Earthfile for our new private git repo
+# docker / podman
 mkdir -p ~/odd-project
 cd ~/odd-project
 git init
 cat <<EOF >> Earthfile
-
+VERSION 0.7
 FROM alpine:latest
 
 build:
@@ -90,6 +95,7 @@ git push -u origin trunk
 # Create a second Earthfile in a subdirectory which will contain a Command:
 mkdir -p weirdcommands
 cat <<EOF >> weirdcommands/Earthfile
+VERSION 0.7
 TOUCH:
   COMMAND
   ARG file=touched
@@ -117,12 +123,12 @@ echo "=== Test remote build under repo subdir ==="
 $earthly -V myserver/project/weirdcommands:trunk+target
 
 # test that the container was built and runs
-docker run --rm weirdrepo:latest | grep "hello weird world"
+"$frontend" run --rm weirdrepo:latest | grep "hello weird world"
 
 # next test that we can reference commands in the weird repo;
 # create a local Earthfile (that wont be saved to git)
 cat <<EOF > Earthfile
-
+VERSION 0.7
 IMPORT myserver/project/weirdcommands:trunk
 
 FROM alpine:latest
